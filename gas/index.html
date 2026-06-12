@@ -1,0 +1,1405 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ProjectFlow</title>
+  <?!= include('styles'); ?>
+</head>
+<body>
+
+<!-- ===== Top Header ===== -->
+<header class="app-header">
+  <div class="logo" id="logo">ProjectFlow</div>
+  <nav class="breadcrumb" id="breadcrumb"></nav>
+</header>
+
+<!-- ===== Main View ===== -->
+<main class="main-content" id="app"></main>
+
+<script>
+/* ================================================================
+   ProjectFlow GAS SPA — vanilla JS
+   ================================================================ */
+
+// ----------------------------------------------------------------
+// Utility helpers
+// ----------------------------------------------------------------
+
+/**
+ * Escape a string for safe insertion into innerHTML.
+ * Usage: only use this for strings going into innerHTML where
+ * we must insert HTML structure. Prefer textContent where possible.
+ */
+function esc(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** Set textContent of a node, returning it for chaining. */
+function setText(el, text) {
+  el.textContent = (text == null) ? '' : String(text);
+  return el;
+}
+
+/** Create an element with optional CSS class(es) and optional text. */
+function el(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+/** Format YYYY-MM-DD → YYYY/MM/DD */
+function formatDate(d) {
+  if (!d) return '';
+  var parts = String(d).split('-');
+  if (parts.length < 3) return d;
+  return parts[0] + '/' + parts[1] + '/' + parts[2];
+}
+
+/** Today as YYYY-MM-DD */
+function todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/** Is due_date strictly before today? */
+function isOverdue(due) {
+  if (!due) return false;
+  return String(due) < todayStr();
+}
+
+/** Format ISO timestamp for Japanese locale display */
+function fmtDateTime(iso) {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString('ja-JP');
+  } catch (e) {
+    return iso;
+  }
+}
+
+// ----------------------------------------------------------------
+// rpc helper
+// ----------------------------------------------------------------
+function rpc(name) {
+  var args = Array.prototype.slice.call(arguments, 1);
+  return new Promise(function(res, rej) {
+    var runner = google.script.run
+      .withSuccessHandler(res)
+      .withFailureHandler(rej);
+    runner[name].apply(runner, args);
+  });
+}
+
+// ----------------------------------------------------------------
+// Markdown renderer (XSS-safe, DOM-based)
+// ----------------------------------------------------------------
+function renderMarkdown(text) {
+  var container = el('div', 'markdown-body');
+  if (!text) return container;
+  var lines = String(text).split('\n');
+  var i = 0;
+  while (i < lines.length) {
+    var line = lines[i];
+    if (line.startsWith('## ')) {
+      var h = el('h2');
+      appendInline(h, line.slice(3));
+      container.appendChild(h);
+    } else if (line.startsWith('### ')) {
+      var h3 = el('h3');
+      appendInline(h3, line.slice(4));
+      container.appendChild(h3);
+    } else if (line.startsWith('- ') || line.startsWith('* ')) {
+      // collect consecutive list items
+      var ul = el('ul');
+      while (i < lines.length && (lines[i].startsWith('- ') || lines[i].startsWith('* '))) {
+        var li = el('li');
+        appendInline(li, lines[i].slice(2));
+        ul.appendChild(li);
+        i++;
+      }
+      container.appendChild(ul);
+      continue; // i already incremented
+    } else if (line.trim() === '') {
+      // blank line: skip
+    } else {
+      var p = el('p');
+      appendInline(p, line);
+      container.appendChild(p);
+    }
+    i++;
+  }
+  return container;
+}
+
+/**
+ * Append inline content (handling **bold**) to a parent element.
+ * Safe: uses textContent only.
+ */
+function appendInline(parent, text) {
+  var parts = String(text).split(/(\*\*[^*]+\*\*)/);
+  for (var j = 0; j < parts.length; j++) {
+    var part = parts[j];
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      var strong = el('strong');
+      strong.textContent = part.slice(2, -2);
+      parent.appendChild(strong);
+    } else {
+      parent.appendChild(document.createTextNode(part));
+    }
+  }
+}
+
+// ----------------------------------------------------------------
+// Spinner
+// ----------------------------------------------------------------
+function makeSpinner(size) {
+  return el('div', 'spinner ' + (size || ''));
+}
+
+// ----------------------------------------------------------------
+// Badge factories
+// ----------------------------------------------------------------
+function priorityBadge(priority) {
+  var labels = { high: '高', medium: '中', low: '低' };
+  return el('span', 'badge badge-priority-' + priority, labels[priority] || priority);
+}
+
+function statusBadge(status) {
+  var labels = { todo: '未着手', in_progress: '進行中', done: '完了' };
+  return el('span', 'badge badge-status-' + status, labels[status] || status);
+}
+
+function aiBadge() {
+  return el('span', 'badge badge-ai', 'AI');
+}
+
+// ----------------------------------------------------------------
+// Router
+// ----------------------------------------------------------------
+var currentRoute = null;
+
+function navigate(hash) {
+  window.location.hash = hash;
+}
+
+function getHash() {
+  return window.location.hash || '#/';
+}
+
+function parseRoute(hash) {
+  var path = hash.replace(/^#/, '') || '/';
+  // #/
+  if (path === '/' || path === '') return { name: 'dashboard' };
+  // #/project/{id}/new-meeting
+  var nmMatch = path.match(/^\/project\/([^\/]+)\/new-meeting$/);
+  if (nmMatch) return { name: 'new-meeting', projectId: nmMatch[1] };
+  // #/project/{id}
+  var pMatch = path.match(/^\/project\/([^\/]+)$/);
+  if (pMatch) return { name: 'project', projectId: pMatch[1] };
+  // #/meeting/{id}
+  var mMatch = path.match(/^\/meeting\/([^\/]+)$/);
+  if (mMatch) return { name: 'meeting', meetingId: mMatch[1] };
+  return { name: 'notfound' };
+}
+
+// Per-route state (e.g. active tab for project detail)
+var routeState = {};
+
+function onHashChange() {
+  var hash = getHash();
+  var route = parseRoute(hash);
+  renderRoute(route);
+}
+
+function renderRoute(route) {
+  var app = document.getElementById('app');
+  app.innerHTML = '';
+  updateBreadcrumb(route);
+  if (route.name === 'dashboard') {
+    renderDashboard(app);
+  } else if (route.name === 'project') {
+    renderProjectDetail(app, route.projectId);
+  } else if (route.name === 'new-meeting') {
+    renderNewMeeting(app, route.projectId);
+  } else if (route.name === 'meeting') {
+    renderMeetingDetail(app, route.meetingId);
+  } else {
+    app.appendChild(el('p', 'text-gray', 'ページが見つかりません。'));
+  }
+}
+
+function updateBreadcrumb(route) {
+  var bc = document.getElementById('breadcrumb');
+  bc.innerHTML = '';
+  if (route.name === 'dashboard') {
+    // no breadcrumb on dashboard
+    return;
+  }
+  var homeLink = el('span', 'bc-link', 'ダッシュボード');
+  homeLink.addEventListener('click', function() { navigate('#/'); });
+  bc.appendChild(homeLink);
+
+  if (route.name === 'project') {
+    bc.appendChild(el('span', 'bc-sep', '/'));
+    bc.appendChild(el('span', 'bc-current', routeState['project_name_' + route.projectId] || '…'));
+  } else if (route.name === 'new-meeting') {
+    bc.appendChild(el('span', 'bc-sep', '/'));
+    var projLink = el('span', 'bc-link', routeState['project_name_' + route.projectId] || 'プロジェクト');
+    projLink.addEventListener('click', function() { navigate('#/project/' + route.projectId); });
+    bc.appendChild(projLink);
+    bc.appendChild(el('span', 'bc-sep', '/'));
+    bc.appendChild(el('span', 'bc-current', '議事録を追加'));
+  } else if (route.name === 'meeting') {
+    var pid = routeState['meeting_project_' + route.meetingId];
+    if (pid) {
+      bc.appendChild(el('span', 'bc-sep', '/'));
+      var pLink = el('span', 'bc-link', routeState['project_name_' + pid] || 'プロジェクト');
+      pLink.addEventListener('click', function() { navigate('#/project/' + pid); });
+      bc.appendChild(pLink);
+    }
+    bc.appendChild(el('span', 'bc-sep', '/'));
+    bc.appendChild(el('span', 'bc-current', routeState['meeting_title_' + route.meetingId] || '…'));
+  }
+}
+
+// ================================================================
+// DASHBOARD
+// ================================================================
+function renderDashboard(container) {
+  var loadDiv = el('div', 'loading-state');
+  loadDiv.appendChild(makeSpinner('lg'));
+  loadDiv.appendChild(el('span', null, '読み込み中…'));
+  container.appendChild(loadDiv);
+
+  rpc('apiGetDashboard').then(function(data) {
+    container.innerHTML = '';
+    buildDashboard(container, data);
+  }).catch(function(err) {
+    container.innerHTML = '';
+    var errBar = buildErrorBar(err, function() { renderDashboard(container); });
+    container.appendChild(errBar);
+  });
+}
+
+function buildDashboard(container, data) {
+  // Title
+  container.appendChild(el('h1', 'page-title', 'ダッシュボード'));
+
+  // ---- 今やること ----
+  var todaySection = el('section');
+  todaySection.style.marginBottom = '40px';
+  todaySection.appendChild(el('h2', 'section-title', '今やること'));
+
+  var hasAny = (data.overdue.length + data.due_this_week.length + data.high_priority.length) > 0;
+  if (!hasAny) {
+    todaySection.appendChild(el('div', 'empty-state', '対応が必要なタスクはありません 🎉'));
+  } else {
+    if (data.overdue.length > 0) {
+      todaySection.appendChild(buildTaskGroup('期限切れ', data.overdue, 'overdue'));
+    }
+    if (data.due_this_week.length > 0) {
+      todaySection.appendChild(buildTaskGroup('今週が期限', data.due_this_week, 'week'));
+    }
+    if (data.high_priority.length > 0) {
+      todaySection.appendChild(buildTaskGroup('優先度: 高', data.high_priority, 'high'));
+    }
+  }
+  container.appendChild(todaySection);
+
+  // ---- プロジェクト ----
+  var projSection = el('section');
+  projSection.appendChild(el('h2', 'section-title', 'プロジェクト'));
+  var grid = el('div', 'project-grid');
+  projSection.appendChild(grid);
+
+  function renderProjects(projects) {
+    grid.innerHTML = '';
+    projects.forEach(function(p) {
+      grid.appendChild(buildProjectCard(p));
+    });
+    // New project card
+    grid.appendChild(buildNewProjectCard(function() {
+      // re-fetch dashboard
+      renderDashboard(container.parentNode || document.getElementById('app'));
+      // Actually we need the real container; use app directly
+      var app = document.getElementById('app');
+      app.innerHTML = '';
+      renderDashboard(app);
+    }));
+  }
+
+  renderProjects(data.projects);
+  container.appendChild(projSection);
+}
+
+function buildTaskGroup(title, tasks, type) {
+  var div = el('div', 'action-group ' + type);
+  var h = el('h3', 'action-group-title');
+  h.appendChild(document.createTextNode(title));
+  var cnt = el('span', 'count');
+  cnt.textContent = tasks.length + '件';
+  h.appendChild(cnt);
+  div.appendChild(h);
+
+  var list = el('div', 'task-list');
+  tasks.forEach(function(task) {
+    list.appendChild(buildTaskRow(task));
+  });
+  div.appendChild(list);
+  return div;
+}
+
+function buildTaskRow(task) {
+  var row = el('div', 'task-row');
+  row.addEventListener('click', function() {
+    navigate('#/project/' + task.project_id);
+  });
+
+  var main = el('div', 'task-row-main');
+  main.appendChild(el('div', 'task-row-title', task.title));
+  if (task.assignee) {
+    main.appendChild(el('div', 'task-row-sub', task.assignee));
+  }
+  row.appendChild(main);
+
+  var meta = el('div', 'task-row-meta');
+  meta.appendChild(priorityBadge(task.priority));
+  if (task.due_date) {
+    var dateSpan = el('span', 'date-label' + (isOverdue(task.due_date) ? ' overdue' : ''), formatDate(task.due_date));
+    meta.appendChild(dateSpan);
+  }
+  row.appendChild(meta);
+  return row;
+}
+
+function buildProjectCard(p) {
+  var card = el('div', 'project-card');
+  card.addEventListener('click', function() {
+    navigate('#/project/' + p.id);
+  });
+  card.appendChild(el('div', 'project-card-name', p.name));
+  if (p.description) {
+    card.appendChild(el('p', 'project-card-desc', p.description));
+  }
+  var meta = el('div', 'project-card-meta');
+  var taskStat = el('span', 'project-card-stat tasks');
+  taskStat.textContent = '未完了 ' + p.open_task_count + '件';
+  var mtgStat = el('span', 'project-card-stat meetings');
+  mtgStat.textContent = '議事録 ' + p.meeting_count + '件';
+  meta.appendChild(taskStat);
+  meta.appendChild(mtgStat);
+  card.appendChild(meta);
+  return card;
+}
+
+function buildNewProjectCard(onCreated) {
+  var wrapper = el('div');
+
+  var btn = el('button', 'new-project-card');
+  var plus = el('span', 'plus-icon', '+');
+  btn.appendChild(plus);
+  btn.appendChild(document.createTextNode(' 新規プロジェクト'));
+  wrapper.appendChild(btn);
+
+  var formCard = el('div', 'new-project-form-card hidden');
+  var formTitle = el('div', null);
+  formTitle.style.fontWeight = '600';
+  formTitle.style.marginBottom = '12px';
+  formTitle.style.fontSize = '0.9rem';
+  formTitle.textContent = '新規プロジェクト';
+  formCard.appendChild(formTitle);
+
+  var nameInput = el('input', 'input');
+  nameInput.type = 'text';
+  nameInput.placeholder = 'プロジェクト名 *';
+  nameInput.style.marginBottom = '8px';
+
+  var descInput = el('textarea', 'textarea');
+  descInput.placeholder = '説明（任意）';
+  descInput.rows = 2;
+  descInput.style.marginBottom = '8px';
+
+  var errP = el('p', 'text-xs hidden');
+  errP.style.color = '#b91c1c';
+  errP.style.marginBottom = '8px';
+
+  var btnRow = el('div', 'flex gap-8');
+  var submitBtn = el('button', 'btn btn-primary btn-sm', '作成');
+  var cancelBtn = el('button', 'btn btn-secondary btn-sm', 'キャンセル');
+  btnRow.appendChild(submitBtn);
+  btnRow.appendChild(cancelBtn);
+
+  formCard.appendChild(nameInput);
+  formCard.appendChild(descInput);
+  formCard.appendChild(errP);
+  formCard.appendChild(btnRow);
+  wrapper.appendChild(formCard);
+
+  btn.addEventListener('click', function() {
+    btn.classList.add('hidden');
+    formCard.classList.remove('hidden');
+    nameInput.focus();
+  });
+
+  cancelBtn.addEventListener('click', function() {
+    formCard.classList.add('hidden');
+    btn.classList.remove('hidden');
+    nameInput.value = '';
+    descInput.value = '';
+    errP.classList.add('hidden');
+  });
+
+  submitBtn.addEventListener('click', function() {
+    var name = nameInput.value.trim();
+    if (!name) { nameInput.focus(); return; }
+    submitBtn.disabled = true;
+    setText(submitBtn, '作成中…');
+    errP.classList.add('hidden');
+
+    rpc('apiCreateProject', name, descInput.value.trim()).then(function() {
+      nameInput.value = '';
+      descInput.value = '';
+      formCard.classList.add('hidden');
+      btn.classList.remove('hidden');
+      submitBtn.disabled = false;
+      setText(submitBtn, '作成');
+      onCreated();
+    }).catch(function(err) {
+      errP.textContent = err && err.message ? err.message : '作成に失敗しました';
+      errP.classList.remove('hidden');
+      submitBtn.disabled = false;
+      setText(submitBtn, '作成');
+    });
+  });
+
+  return wrapper;
+}
+
+// ================================================================
+// PROJECT DETAIL
+// ================================================================
+
+// Per-project tab state
+var projectTabState = {};
+
+function renderProjectDetail(container, projectId) {
+  var loadDiv = el('div', 'loading-state');
+  loadDiv.appendChild(makeSpinner('lg'));
+  loadDiv.appendChild(el('span', null, '読み込み中…'));
+  container.appendChild(loadDiv);
+
+  rpc('apiGetProjectDetail', projectId).then(function(data) {
+    container.innerHTML = '';
+    // Cache project name for breadcrumb
+    routeState['project_name_' + projectId] = data.name;
+    updateBreadcrumb({ name: 'project', projectId: projectId });
+    buildProjectDetail(container, data, projectId);
+  }).catch(function(err) {
+    container.innerHTML = '';
+    container.appendChild(buildErrorBar(err, function() { renderProjectDetail(container, projectId); }));
+  });
+}
+
+function buildProjectDetail(container, data, projectId) {
+  // ---- Header ----
+  var header = el('div', 'project-header');
+  var headerInfo = el('div', 'project-header-info');
+  headerInfo.appendChild(el('h1', null, data.name));
+  if (data.description) {
+    headerInfo.appendChild(el('p', null, data.description));
+  }
+  header.appendChild(headerInfo);
+
+  var addMtgBtn = el('button', 'btn btn-primary', '+ 議事録を追加');
+  addMtgBtn.addEventListener('click', function() {
+    navigate('#/project/' + projectId + '/new-meeting');
+  });
+  header.appendChild(addMtgBtn);
+  container.appendChild(header);
+
+  // ---- Tab bar ----
+  var TABS = [
+    { id: 'overview',   label: '概要' },
+    { id: 'meetings',   label: '議事録' },
+    { id: 'tasks',      label: 'タスク' },
+    { id: 'activities', label: '経緯' }
+  ];
+
+  var activeTab = projectTabState[projectId] || 'overview';
+
+  var tabBar = el('div', 'tab-bar');
+  container.appendChild(tabBar);
+
+  var contentArea = el('div');
+  container.appendChild(contentArea);
+
+  function showTab(tabId) {
+    activeTab = tabId;
+    projectTabState[projectId] = tabId;
+    // update tab buttons
+    var btns = tabBar.querySelectorAll('.tab-btn');
+    btns.forEach(function(b) {
+      b.classList.toggle('active', b.dataset.tab === tabId);
+    });
+    // render content
+    contentArea.innerHTML = '';
+    if (tabId === 'overview') {
+      buildOverviewTab(contentArea, data, projectId, function() {
+        // re-fetch project
+        container.innerHTML = '';
+        renderProjectDetail(container, projectId);
+      });
+    } else if (tabId === 'meetings') {
+      buildMeetingsTab(contentArea, data, projectId);
+    } else if (tabId === 'tasks') {
+      buildTasksTab(contentArea, data, projectId, function() {
+        container.innerHTML = '';
+        renderProjectDetail(container, projectId);
+      });
+    } else if (tabId === 'activities') {
+      buildActivitiesTab(contentArea, data.activities);
+    }
+  }
+
+  TABS.forEach(function(t) {
+    var btn = el('button', 'tab-btn' + (t.id === activeTab ? ' active' : ''), t.label);
+    btn.dataset.tab = t.id;
+    btn.addEventListener('click', function() { showTab(t.id); });
+    tabBar.appendChild(btn);
+  });
+
+  showTab(activeTab);
+}
+
+// ---- Overview tab ----
+function buildOverviewTab(container, data, projectId, onDigestCreated) {
+  var openTasks = data.tasks.filter(function(t) { return t.status !== 'done'; });
+  var allTasks = data.tasks;
+  var meetings = data.meetings;
+
+  // Stats row
+  var stats = el('div', 'stats-row');
+  var sc1 = el('div', 'stat-card');
+  sc1.appendChild(el('div', 'stat-value', String(openTasks.length)));
+  sc1.appendChild(el('div', 'stat-label', '未完了タスク'));
+  var sc2 = el('div', 'stat-card');
+  sc2.appendChild(el('div', 'stat-value', String(meetings.length)));
+  sc2.appendChild(el('div', 'stat-label', '議事録'));
+  var sc3 = el('div', 'stat-card');
+  sc3.appendChild(el('div', 'stat-value', String(allTasks.length)));
+  sc3.appendChild(el('div', 'stat-label', '全タスク'));
+  stats.appendChild(sc1);
+  stats.appendChild(sc2);
+  stats.appendChild(sc3);
+  container.appendChild(stats);
+
+  // Digest card
+  var digestCard = el('div', 'digest-card');
+  var dHeader = el('div', 'digest-card-header');
+  dHeader.appendChild(el('h3', null, '現状整理'));
+
+  var digestBtn = el('button', 'btn btn-primary', '現状を整理する');
+  var digestErr = el('div', 'alert-red hidden');
+  var digestProgress = el('div', 'progress-area hidden');
+  digestProgress.appendChild(makeSpinner('sm'));
+  digestProgress.appendChild(document.createTextNode('Claudeが現状を整理しています…'));
+
+  digestBtn.addEventListener('click', function() {
+    digestBtn.disabled = true;
+    digestErr.classList.add('hidden');
+    digestProgress.classList.remove('hidden');
+
+    rpc('apiGenerateDigest', projectId).then(function() {
+      digestProgress.classList.add('hidden');
+      digestBtn.disabled = false;
+      onDigestCreated();
+    }).catch(function(err) {
+      digestProgress.classList.add('hidden');
+      digestBtn.disabled = false;
+      digestErr.textContent = err && err.message ? err.message : '現状整理に失敗しました';
+      digestErr.classList.remove('hidden');
+    });
+  });
+
+  dHeader.appendChild(digestBtn);
+  digestCard.appendChild(dHeader);
+  digestCard.appendChild(digestErr);
+  digestCard.appendChild(digestProgress);
+
+  // Latest digest
+  var digests = data.activities.filter(function(a) { return a.type === 'digest'; });
+  digests.sort(function(a, b) { return b.created_at.localeCompare(a.created_at); });
+  var latest = digests[0];
+
+  if (latest) {
+    var meta = el('p', 'digest-meta', '最終更新: ' + fmtDateTime(latest.created_at));
+    var content = el('div', 'digest-content');
+    content.appendChild(renderMarkdown(latest.content));
+    digestCard.appendChild(meta);
+    digestCard.appendChild(content);
+  } else {
+    digestCard.appendChild(el('p', 'text-sm text-gray', 'まだ現状整理はありません。「現状を整理する」ボタンで生成できます。'));
+  }
+
+  container.appendChild(digestCard);
+}
+
+// ---- Meetings tab ----
+function buildMeetingsTab(container, data, projectId) {
+  var meetings = data.meetings.slice().sort(function(a, b) {
+    return b.date.localeCompare(a.date);
+  });
+
+  if (meetings.length === 0) {
+    var empty = el('div', 'empty-state');
+    empty.appendChild(document.createTextNode('議事録がありません。'));
+    empty.appendChild(el('br'));
+    var link = el('span');
+    link.style.color = '#4f46e5';
+    link.style.cursor = 'pointer';
+    link.textContent = '+ 議事録を追加';
+    link.addEventListener('click', function() { navigate('#/project/' + projectId + '/new-meeting'); });
+    empty.appendChild(link);
+    container.appendChild(empty);
+    return;
+  }
+
+  meetings.forEach(function(m) {
+    // cache meeting→project for breadcrumb
+    routeState['meeting_project_' + m.id] = projectId;
+    routeState['meeting_title_' + m.id] = m.title || '（無題）';
+    container.appendChild(buildMeetingRow(m, projectId));
+  });
+}
+
+function buildMeetingRow(m, projectId) {
+  var row = el('div', 'meeting-row');
+  row.addEventListener('click', function() { navigate('#/meeting/' + m.id); });
+
+  row.appendChild(el('span', 'meeting-row-date', formatDate(m.date)));
+
+  var main = el('div', 'meeting-row-main');
+  main.appendChild(el('div', 'meeting-row-title', m.title || '（無題）'));
+  var decisions = Array.isArray(m.decisions) ? m.decisions : [];
+  if (decisions.length > 0) {
+    main.appendChild(el('div', 'meeting-row-sub', '決定事項 ' + decisions.length + '件'));
+  }
+  row.appendChild(main);
+
+  if (m.audio_filename) {
+    var badges = el('div', 'meeting-row-badges');
+    var audioBadge = el('span', 'badge badge-audio', '音声');
+    badges.appendChild(audioBadge);
+    row.appendChild(badges);
+  }
+
+  return row;
+}
+
+// ---- Tasks kanban tab ----
+function buildTasksTab(container, data, projectId, onTaskUpdated) {
+  var COLS = [
+    { status: 'todo',        label: '未着手' },
+    { status: 'in_progress', label: '進行中' },
+    { status: 'done',        label: '完了' }
+  ];
+  var STATUS_SEQ = ['todo', 'in_progress', 'done'];
+
+  var board = el('div', 'kanban-board');
+
+  // We keep a local mutable task list for optimistic UI
+  var localTasks = data.tasks.slice();
+
+  function rebuildBoard() {
+    board.innerHTML = '';
+    COLS.forEach(function(col) {
+      var colEl = el('div', 'kanban-col ' + col.status);
+      var colHeader = el('div', 'kanban-col-header');
+      colHeader.appendChild(document.createTextNode(col.label));
+      var cnt = el('span', 'col-count');
+      var colTasks = localTasks.filter(function(t) { return t.status === col.status; });
+      cnt.textContent = String(colTasks.length);
+      colHeader.appendChild(cnt);
+      colEl.appendChild(colHeader);
+
+      colTasks.forEach(function(task) {
+        colEl.appendChild(buildTaskCard(task, STATUS_SEQ, function(taskId, newStatus) {
+          // Optimistic update
+          localTasks = localTasks.map(function(t) {
+            return t.id === taskId ? Object.assign({}, t, { status: newStatus }) : t;
+          });
+          rebuildBoard();
+          rpc('apiUpdateTask', taskId, { status: newStatus }).then(function() {
+            onTaskUpdated();
+          }).catch(function() {
+            // revert
+            localTasks = data.tasks.slice();
+            rebuildBoard();
+          });
+        }));
+      });
+
+      // + add task form
+      colEl.appendChild(buildAddTaskInline(projectId, col.status, function(newTask) {
+        if (newTask) {
+          localTasks.push(newTask);
+          rebuildBoard();
+        }
+        onTaskUpdated();
+      }));
+
+      board.appendChild(colEl);
+    });
+  }
+
+  rebuildBoard();
+  container.appendChild(board);
+}
+
+function buildTaskCard(task, statusSeq, onStatusChange) {
+  var card = el('div', 'task-card');
+
+  var cardHeader = el('div', 'task-card-header');
+  cardHeader.appendChild(el('span', 'task-card-title', task.title));
+  if (task.source === 'ai') {
+    cardHeader.appendChild(aiBadge());
+  }
+  card.appendChild(cardHeader);
+
+  var badges = el('div', 'task-card-badges');
+  badges.appendChild(priorityBadge(task.priority));
+  if (task.due_date) {
+    var dateSpan = el('span', 'date-label' + (isOverdue(task.due_date) ? ' overdue' : ''), formatDate(task.due_date));
+    badges.appendChild(dateSpan);
+  }
+  if (task.assignee) {
+    badges.appendChild(el('span', 'text-xs text-gray', task.assignee));
+  }
+  card.appendChild(badges);
+
+  var footer = el('div', 'task-card-footer');
+  var idx = statusSeq.indexOf(task.status);
+  var prevBtn = el('button', 'status-nav-btn', '←');
+  var nextBtn = el('button', 'status-nav-btn', '→');
+  prevBtn.disabled = (idx <= 0);
+  nextBtn.disabled = (idx >= statusSeq.length - 1);
+  prevBtn.title = '前のステータスへ';
+  nextBtn.title = '次のステータスへ';
+  prevBtn.addEventListener('click', function() {
+    if (idx > 0) onStatusChange(task.id, statusSeq[idx - 1]);
+  });
+  nextBtn.addEventListener('click', function() {
+    if (idx < statusSeq.length - 1) onStatusChange(task.id, statusSeq[idx + 1]);
+  });
+  footer.appendChild(prevBtn);
+  footer.appendChild(nextBtn);
+  card.appendChild(footer);
+
+  return card;
+}
+
+function buildAddTaskInline(projectId, defaultStatus, onAdded) {
+  var wrapper = el('div');
+
+  var trigger = el('button', 'add-task-trigger', '+ タスク追加');
+  wrapper.appendChild(trigger);
+
+  var form = el('div', 'add-task-form hidden');
+  var titleInput = el('input', 'input');
+  titleInput.type = 'text';
+  titleInput.placeholder = 'タスクタイトル *';
+  titleInput.style.marginBottom = '8px';
+
+  var assigneeInput = el('input', 'input');
+  assigneeInput.type = 'text';
+  assigneeInput.placeholder = '担当者';
+  assigneeInput.style.marginBottom = '8px';
+
+  var formRow = el('div', 'form-row');
+  var dueDateInput = el('input', 'input');
+  dueDateInput.type = 'date';
+  dueDateInput.style.flex = '1';
+
+  var prioritySelect = el('select', 'select');
+  prioritySelect.style.width = 'auto';
+  [['high','高'],['medium','中'],['low','低']].forEach(function(opt) {
+    var o = el('option', null, opt[1]);
+    o.value = opt[0];
+    if (opt[0] === 'medium') o.selected = true;
+    prioritySelect.appendChild(o);
+  });
+  formRow.appendChild(dueDateInput);
+  formRow.appendChild(prioritySelect);
+
+  var errP = el('p', 'hidden');
+  errP.style.color = '#b91c1c';
+  errP.style.fontSize = '0.78rem';
+  errP.style.marginBottom = '6px';
+
+  var btnRow = el('div', 'flex gap-8 mt-8');
+  var addBtn = el('button', 'btn btn-primary btn-xs', '追加');
+  var cancelBtn = el('button', 'btn-ghost', 'キャンセル');
+  cancelBtn.style.fontSize = '0.78rem';
+  btnRow.appendChild(addBtn);
+  btnRow.appendChild(cancelBtn);
+
+  form.appendChild(titleInput);
+  form.appendChild(assigneeInput);
+  form.appendChild(formRow);
+  form.appendChild(errP);
+  form.appendChild(btnRow);
+  wrapper.appendChild(form);
+
+  trigger.addEventListener('click', function() {
+    trigger.classList.add('hidden');
+    form.classList.remove('hidden');
+    titleInput.focus();
+  });
+
+  cancelBtn.addEventListener('click', function() {
+    form.classList.add('hidden');
+    trigger.classList.remove('hidden');
+    titleInput.value = '';
+    assigneeInput.value = '';
+    dueDateInput.value = '';
+    prioritySelect.value = 'medium';
+    errP.classList.add('hidden');
+  });
+
+  addBtn.addEventListener('click', function() {
+    var title = titleInput.value.trim();
+    if (!title) { titleInput.focus(); return; }
+    addBtn.disabled = true;
+    setText(addBtn, '追加中…');
+    errP.classList.add('hidden');
+
+    var payload = {
+      projectId: projectId,
+      title: title,
+      description: '',
+      assignee: assigneeInput.value.trim(),
+      dueDate: dueDateInput.value || null,
+      priority: prioritySelect.value
+    };
+
+    rpc('apiCreateTask', payload).then(function(newTask) {
+      titleInput.value = '';
+      assigneeInput.value = '';
+      dueDateInput.value = '';
+      prioritySelect.value = 'medium';
+      form.classList.add('hidden');
+      trigger.classList.remove('hidden');
+      addBtn.disabled = false;
+      setText(addBtn, '追加');
+      onAdded(newTask);
+    }).catch(function(err) {
+      errP.textContent = err && err.message ? err.message : '追加に失敗しました';
+      errP.classList.remove('hidden');
+      addBtn.disabled = false;
+      setText(addBtn, '追加');
+    });
+  });
+
+  return wrapper;
+}
+
+// ---- Activities tab ----
+var ACTIVITY_LABELS = {
+  project_created: '作成',
+  meeting_added:   '議事録',
+  task_created:    'タスク',
+  task_updated:    '更新',
+  digest:          '現状整理',
+  note:            'メモ'
+};
+
+var ACTIVITY_ICONS = {
+  project_created: '🚀',
+  meeting_added:   '🗒️',
+  task_created:    '✅',
+  task_updated:    '✏️',
+  digest:          '🔍',
+  note:            '📌'
+};
+
+function buildActivitiesTab(container, activities) {
+  var sorted = activities.slice().sort(function(a, b) {
+    return b.created_at.localeCompare(a.created_at);
+  });
+
+  if (sorted.length === 0) {
+    container.appendChild(el('div', 'empty-state', '経緯がありません。'));
+    return;
+  }
+
+  var wrap = el('div', 'card');
+  wrap.style.padding = '24px';
+  var timeline = el('div', 'timeline');
+
+  sorted.forEach(function(activity, i) {
+    var item = el('div', 'timeline-item');
+
+    var iconCol = el('div', 'timeline-icon-col');
+    var icon = el('div', 'timeline-icon');
+    icon.textContent = ACTIVITY_ICONS[activity.type] || '•';
+    iconCol.appendChild(icon);
+    if (i < sorted.length - 1) {
+      iconCol.appendChild(el('div', 'timeline-line'));
+    }
+    item.appendChild(iconCol);
+
+    var body = el('div', 'timeline-body');
+    var meta = el('div', 'timeline-meta');
+    meta.appendChild(el('span', 'timeline-type', ACTIVITY_LABELS[activity.type] || activity.type));
+    meta.appendChild(el('span', 'timeline-time', fmtDateTime(activity.created_at)));
+    body.appendChild(meta);
+
+    if (activity.type === 'digest') {
+      var expanded = false;
+      var firstLine = activity.content.split('\n')[0];
+      var hasMore = activity.content.indexOf('\n') !== -1;
+
+      var contentDiv = el('div', 'timeline-content');
+      var collapsed = el('div');
+      collapsed.appendChild(el('p', null, firstLine));
+      var expandBtn = el('button', 'btn-link');
+      expandBtn.style.display = hasMore ? 'inline' : 'none';
+      expandBtn.textContent = '展開';
+      collapsed.appendChild(expandBtn);
+
+      var expandedDiv = el('div', 'hidden');
+      expandedDiv.appendChild(renderMarkdown(activity.content));
+      var collapseBtn = el('button', 'btn-link', '閉じる');
+      expandedDiv.appendChild(collapseBtn);
+
+      expandBtn.addEventListener('click', function() {
+        expanded = true;
+        collapsed.classList.add('hidden');
+        expandedDiv.classList.remove('hidden');
+      });
+      collapseBtn.addEventListener('click', function() {
+        expanded = false;
+        collapsed.classList.remove('hidden');
+        expandedDiv.classList.add('hidden');
+      });
+
+      contentDiv.appendChild(collapsed);
+      contentDiv.appendChild(expandedDiv);
+      body.appendChild(contentDiv);
+    } else {
+      body.appendChild(el('div', 'timeline-content', activity.content));
+    }
+
+    item.appendChild(body);
+    timeline.appendChild(item);
+  });
+
+  wrap.appendChild(timeline);
+  container.appendChild(wrap);
+}
+
+// ================================================================
+// NEW MEETING
+// ================================================================
+function renderNewMeeting(container, projectId) {
+  // Fetch project name for breadcrumb if not cached
+  if (!routeState['project_name_' + projectId]) {
+    rpc('apiGetProjectDetail', projectId).then(function(data) {
+      routeState['project_name_' + projectId] = data.name;
+      updateBreadcrumb({ name: 'new-meeting', projectId: projectId });
+    }).catch(function() {});
+  }
+
+  container.appendChild(el('h1', 'page-title', '議事録を追加'));
+
+  var method = 'audio'; // 'audio' | 'text'
+
+  // ---- Method toggle ----
+  var toggle = el('div', 'method-toggle');
+  var audioBtn = el('button', 'method-toggle-btn active', '音声ファイル');
+  var textBtn  = el('button', 'method-toggle-btn', 'テキスト貼り付け');
+  toggle.appendChild(audioBtn);
+  toggle.appendChild(textBtn);
+  container.appendChild(toggle);
+
+  // ---- Form fields ----
+  var formWrap = el('div', 'card');
+
+  // Title
+  var titleGroup = el('div', 'form-group');
+  titleGroup.appendChild(el('label', 'form-label', 'タイトル'));
+  var titleInput = el('input', 'input');
+  titleInput.type = 'text';
+  titleInput.placeholder = '空欄ならAIが自動生成';
+  titleGroup.appendChild(titleInput);
+  formWrap.appendChild(titleGroup);
+
+  // Date
+  var dateGroup = el('div', 'form-group');
+  dateGroup.appendChild(el('label', 'form-label', '日付'));
+  var dateInput = el('input', 'input');
+  dateInput.type = 'date';
+  dateInput.value = todayStr();
+  dateGroup.appendChild(dateInput);
+  formWrap.appendChild(dateGroup);
+
+  // ---- Audio area ----
+  var audioArea = el('div');
+
+  var dropArea = el('label', 'file-drop-area');
+  var dropIcon = el('div', 'drop-icon', '🎙️');
+  var dropText = el('div', 'drop-text', '音声ファイルをクリックまたはドロップして選択');
+  var fileInfo = el('div', 'file-info hidden');
+  var fileInput = el('input');
+  fileInput.type = 'file';
+  fileInput.accept = 'audio/*';
+  dropArea.appendChild(fileInput);
+  dropArea.appendChild(dropIcon);
+  dropArea.appendChild(dropText);
+  dropArea.appendChild(fileInfo);
+  audioArea.appendChild(dropArea);
+
+  fileInput.addEventListener('change', function() {
+    if (fileInput.files && fileInput.files[0]) {
+      var f = fileInput.files[0];
+      fileInfo.textContent = f.name + ' (' + (f.size / 1024 / 1024).toFixed(1) + ' MB)';
+      fileInfo.classList.remove('hidden');
+    }
+  });
+
+  formWrap.appendChild(audioArea);
+
+  // ---- Text area ----
+  var textArea = el('div', 'hidden');
+  var textGroup = el('div', 'form-group');
+  textGroup.appendChild(el('label', 'form-label', '議事録テキスト'));
+  var transcriptInput = el('textarea', 'textarea');
+  transcriptInput.placeholder = '議事録のテキストを貼り付けてください';
+  transcriptInput.rows = 12;
+  textGroup.appendChild(transcriptInput);
+  textArea.appendChild(textGroup);
+  formWrap.appendChild(textArea);
+
+  // ---- Error / Progress ----
+  var errDiv = el('div', 'alert-red hidden');
+  formWrap.appendChild(errDiv);
+
+  var progressArea = el('div', 'progress-area hidden');
+  var progressSpinner = makeSpinner('sm');
+  var progressText = el('span', null, '');
+  progressArea.appendChild(progressSpinner);
+  progressArea.appendChild(progressText);
+  formWrap.appendChild(progressArea);
+
+  // ---- Submit ----
+  var btnRow = el('div', 'flex gap-8 mt-16');
+  var submitBtn = el('button', 'btn btn-primary', '議事録を作成');
+  var backBtn   = el('button', 'btn btn-secondary', 'キャンセル');
+  btnRow.appendChild(submitBtn);
+  btnRow.appendChild(backBtn);
+  formWrap.appendChild(btnRow);
+
+  container.appendChild(formWrap);
+
+  // ---- Toggle logic ----
+  function setMethod(m) {
+    method = m;
+    if (m === 'audio') {
+      audioBtn.classList.add('active');
+      textBtn.classList.remove('active');
+      audioArea.classList.remove('hidden');
+      textArea.classList.add('hidden');
+    } else {
+      textBtn.classList.add('active');
+      audioBtn.classList.remove('active');
+      textArea.classList.remove('hidden');
+      audioArea.classList.add('hidden');
+    }
+  }
+  audioBtn.addEventListener('click', function() { setMethod('audio'); });
+  textBtn.addEventListener('click',  function() { setMethod('text'); });
+
+  backBtn.addEventListener('click', function() { navigate('#/project/' + projectId); });
+
+  // ---- Submit handler ----
+  submitBtn.addEventListener('click', function() {
+    errDiv.classList.add('hidden');
+    errDiv.textContent = '';
+
+    var title = titleInput.value.trim();
+    var date  = dateInput.value || todayStr();
+
+    if (method === 'audio') {
+      var file = fileInput.files && fileInput.files[0];
+      if (!file) {
+        showError('音声ファイルを選択してください。');
+        return;
+      }
+      if (file.size > 20 * 1024 * 1024) {
+        showError('ファイルが大きすぎます(20MBまで)。');
+        return;
+      }
+      setFormDisabled(true);
+      setProgress('文字起こし中…(数分かかることがあります)');
+
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        // strip data:...;base64, prefix
+        var dataUrl = e.target.result;
+        var base64 = dataUrl.split(',')[1];
+        rpc('apiTranscribeAudio', projectId, base64, file.name, file.type).then(function(result) {
+          setProgress('議事録を生成中…タスクを抽出しています');
+          var payload = {
+            projectId: projectId,
+            title: title,
+            date: date,
+            transcript: result.transcript,
+            audioFileId: result.audio_file_id,
+            audioFilename: result.audio_filename
+          };
+          return rpc('apiCreateMeeting', payload);
+        }).then(function(result) {
+          routeState['meeting_project_' + result.meeting.id] = projectId;
+          routeState['meeting_title_'   + result.meeting.id] = result.meeting.title || '（無題）';
+          navigate('#/meeting/' + result.meeting.id);
+        }).catch(function(err) {
+          setFormDisabled(false);
+          setProgress('');
+          showError(err && err.message ? err.message : '処理に失敗しました');
+        });
+      };
+      reader.onerror = function() {
+        setFormDisabled(false);
+        setProgress('');
+        showError('ファイルの読み込みに失敗しました');
+      };
+      reader.readAsDataURL(file);
+
+    } else {
+      // text path
+      var transcript = transcriptInput.value.trim();
+      if (!transcript) {
+        showError('テキストを入力してください。');
+        return;
+      }
+      setFormDisabled(true);
+      setProgress('議事録を生成中…タスクを抽出しています');
+
+      var payload = {
+        projectId: projectId,
+        title: title,
+        date: date,
+        transcript: transcript,
+        audioFileId: null,
+        audioFilename: null
+      };
+      rpc('apiCreateMeeting', payload).then(function(result) {
+        routeState['meeting_project_' + result.meeting.id] = projectId;
+        routeState['meeting_title_'   + result.meeting.id] = result.meeting.title || '（無題）';
+        navigate('#/meeting/' + result.meeting.id);
+      }).catch(function(err) {
+        setFormDisabled(false);
+        setProgress('');
+        showError(err && err.message ? err.message : '議事録の生成に失敗しました');
+      });
+    }
+  });
+
+  function showError(msg) {
+    errDiv.textContent = msg;
+    errDiv.classList.remove('hidden');
+  }
+
+  function setFormDisabled(disabled) {
+    submitBtn.disabled = disabled;
+    backBtn.disabled   = disabled;
+    titleInput.disabled = disabled;
+    dateInput.disabled  = disabled;
+    transcriptInput.disabled = disabled;
+    fileInput.disabled  = disabled;
+    audioBtn.disabled   = disabled;
+    textBtn.disabled    = disabled;
+  }
+
+  function setProgress(msg) {
+    if (msg) {
+      progressText.textContent = msg;
+      progressArea.classList.remove('hidden');
+    } else {
+      progressArea.classList.add('hidden');
+      progressText.textContent = '';
+    }
+  }
+}
+
+// ================================================================
+// MEETING DETAIL
+// ================================================================
+function renderMeetingDetail(container, meetingId) {
+  var loadDiv = el('div', 'loading-state');
+  loadDiv.appendChild(makeSpinner('lg'));
+  loadDiv.appendChild(el('span', null, '読み込み中…'));
+  container.appendChild(loadDiv);
+
+  rpc('apiGetMeeting', meetingId).then(function(data) {
+    container.innerHTML = '';
+    var meeting = data.meeting;
+    var tasks   = data.tasks || [];
+
+    // cache for breadcrumb
+    routeState['meeting_title_' + meetingId] = meeting.title || '（無題）';
+    if (meeting.project_id) {
+      routeState['meeting_project_' + meetingId] = meeting.project_id;
+    }
+    updateBreadcrumb({ name: 'meeting', meetingId: meetingId });
+
+    buildMeetingDetail(container, meeting, tasks, meetingId);
+  }).catch(function(err) {
+    container.innerHTML = '';
+    container.appendChild(buildErrorBar(err, function() { renderMeetingDetail(container, meetingId); }));
+  });
+}
+
+function buildMeetingDetail(container, meeting, tasks, meetingId) {
+  // ---- Header ----
+  var header = el('div', 'meeting-detail-header');
+  header.appendChild(el('h1', null, meeting.title || '（無題）'));
+  var metaRow = el('div', 'meeting-detail-meta');
+  metaRow.appendChild(el('span', null, formatDate(meeting.date)));
+  if (meeting.audio_filename) {
+    metaRow.appendChild(el('span', 'badge badge-audio', '音声: ' + meeting.audio_filename));
+  }
+  header.appendChild(metaRow);
+  container.appendChild(header);
+
+  // ---- Summary ----
+  if (meeting.summary_md) {
+    var summaryCard = el('div', 'meeting-section');
+    summaryCard.appendChild(el('h2', null, '要約'));
+    summaryCard.appendChild(renderMarkdown(meeting.summary_md));
+    container.appendChild(summaryCard);
+  }
+
+  // ---- Decisions ----
+  var decisions = Array.isArray(meeting.decisions) ? meeting.decisions : [];
+  if (decisions.length > 0) {
+    var decCard = el('div', 'meeting-section');
+    decCard.appendChild(el('h2', null, '決定事項'));
+    var ol = el('ol', 'decision-list');
+    decisions.forEach(function(d) {
+      ol.appendChild(el('li', null, d));
+    });
+    decCard.appendChild(ol);
+    container.appendChild(decCard);
+  }
+
+  // ---- Open questions ----
+  var oqs = Array.isArray(meeting.open_questions) ? meeting.open_questions : [];
+  if (oqs.length > 0) {
+    var oqCard = el('div', 'meeting-section');
+    oqCard.appendChild(el('h2', null, '未解決事項'));
+    var ul = el('ul', 'question-list');
+    oqs.forEach(function(q) {
+      ul.appendChild(el('li', null, q));
+    });
+    oqCard.appendChild(ul);
+    container.appendChild(oqCard);
+  }
+
+  // ---- Extracted tasks ----
+  if (tasks.length > 0) {
+    var tasksCard = el('div', 'meeting-section');
+    tasksCard.appendChild(el('h2', null, '抽出されたタスク'));
+    var table = el('table', 'tasks-table');
+    var thead = el('thead');
+    var headerRow = el('tr');
+    ['タイトル','担当者','期日','優先度','ステータス'].forEach(function(h) {
+      headerRow.appendChild(el('th', null, h));
+    });
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+
+    var tbody = el('tbody');
+    tasks.forEach(function(t) {
+      var tr = el('tr');
+      tr.appendChild(el('td', null, t.title));
+      tr.appendChild(el('td', null, t.assignee || '—'));
+      tr.appendChild(el('td', null, t.due_date ? formatDate(t.due_date) : '—'));
+      var priTd = el('td');
+      priTd.appendChild(priorityBadge(t.priority));
+      tr.appendChild(priTd);
+      var stTd = el('td');
+      stTd.appendChild(statusBadge(t.status));
+      tr.appendChild(stTd);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    tasksCard.appendChild(table);
+    container.appendChild(tasksCard);
+  }
+
+  // ---- Transcript ----
+  if (meeting.transcript) {
+    var detailsEl = el('details', 'transcript-details');
+    detailsEl.style.marginBottom = '16px';
+    var summary = el('summary', null, '文字起こし全文');
+    var pre = el('pre', 'transcript-pre', meeting.transcript);
+    detailsEl.appendChild(summary);
+    detailsEl.appendChild(pre);
+    container.appendChild(detailsEl);
+  }
+
+  // ---- Delete button ----
+  var deleteBtn = el('button', 'btn btn-danger', '削除');
+  deleteBtn.addEventListener('click', function() {
+    if (!window.confirm('この議事録を削除しますか？関連するタスクも削除されます。')) return;
+    deleteBtn.disabled = true;
+    setText(deleteBtn, '削除中…');
+    rpc('apiDeleteMeeting', meetingId).then(function() {
+      var projectId = routeState['meeting_project_' + meetingId];
+      if (projectId) {
+        navigate('#/project/' + projectId);
+      } else {
+        navigate('#/');
+      }
+    }).catch(function(err) {
+      deleteBtn.disabled = false;
+      setText(deleteBtn, '削除');
+      var alertEl = el('div', 'alert-red', err && err.message ? err.message : '削除に失敗しました');
+      container.insertBefore(alertEl, deleteBtn);
+    });
+  });
+  container.appendChild(deleteBtn);
+}
+
+// ================================================================
+// Shared: error bar with retry
+// ================================================================
+function buildErrorBar(err, onRetry) {
+  var bar = el('div', 'error-bar');
+  bar.appendChild(el('span', null, err && err.message ? err.message : 'データの取得に失敗しました'));
+  var retryBtn = el('button', 'retry-btn', 'リトライ');
+  retryBtn.addEventListener('click', onRetry);
+  bar.appendChild(retryBtn);
+  return bar;
+}
+
+// ================================================================
+// Init
+// ================================================================
+document.getElementById('logo').addEventListener('click', function() {
+  navigate('#/');
+});
+
+window.addEventListener('hashchange', onHashChange);
+onHashChange(); // render initial route
+</script>
+</body>
+</html>
