@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { Client } from 'ssh2';
 
 function checkBasicAuth(request: NextRequest): boolean {
   const authHeader = request.headers.get('authorization');
@@ -25,48 +24,28 @@ export async function POST(request: NextRequest) {
   }
 
   const host = process.env.VPS_HOST;
-  const port = parseInt(process.env.VPS_PORT || '22');
-  const username = process.env.VPS_USER;
-  const password = process.env.VPS_PASSWORD;
+  const secret = process.env.VPS_REBOOT_SECRET;
 
-  if (!host || !username || !password) {
+  if (!host || !secret) {
     return NextResponse.json(
-      { error: 'VPS connection settings are not configured' },
+      { error: 'VPS settings are not configured' },
       { status: 500 }
     );
   }
 
-  return new Promise<NextResponse>((resolve) => {
-    const conn = new Client();
+  try {
+    const res = await fetch(`http://${host}:8080/reboot`, {
+      method: 'POST',
+      headers: { 'X-Secret': secret },
+      signal: AbortSignal.timeout(10000),
+    });
 
-    const timeout = setTimeout(() => {
-      conn.end();
-      resolve(NextResponse.json({ error: 'Connection timed out' }, { status: 504 }));
-    }, 15000);
-
-    conn
-      .on('ready', () => {
-        conn.exec('sudo reboot', (err, stream) => {
-          if (err) {
-            clearTimeout(timeout);
-            conn.end();
-            resolve(NextResponse.json({ error: err.message }, { status: 500 }));
-            return;
-          }
-          stream
-            .on('close', () => {
-              clearTimeout(timeout);
-              conn.end();
-              resolve(NextResponse.json({ success: true, message: 'VPS 再起動コマンドを送信しました' }));
-            })
-            .on('data', () => {})
-            .stderr.on('data', () => {});
-        });
-      })
-      .on('error', (err) => {
-        clearTimeout(timeout);
-        resolve(NextResponse.json({ error: `SSH 接続に失敗しました: ${err.message}` }, { status: 502 }));
-      })
-      .connect({ host, port, username, password, readyTimeout: 10000 });
-  });
+    if (res.ok) {
+      return NextResponse.json({ success: true, message: 'VPS 再起動コマンドを送信しました' });
+    } else {
+      return NextResponse.json({ error: '認証エラー：シークレットトークンを確認してください' }, { status: 502 });
+    }
+  } catch {
+    return NextResponse.json({ error: 'VPS に接続できませんでした' }, { status: 502 });
+  }
 }
