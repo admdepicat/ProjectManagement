@@ -1,0 +1,10 @@
+[Unit]
+After=network.target
+
+[Service]
+Environment=REBOOT_SECRET=CHANGE_ME
+ExecStart=/usr/bin/python3 /usr/local/bin/reboot-api.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
